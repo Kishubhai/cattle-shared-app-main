@@ -53,6 +53,22 @@ const startServer = async () => {
       console.log('='.repeat(50));
     });
 
+    // Handle port-in-use error without crashing as an uncaught exception
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error('='.repeat(50));
+        console.error(`❌ Port ${PORT} is already in use.`);
+        console.error(`   Another instance of the server may be running.`);
+        console.error(`   To fix this, run one of the following commands:`);
+        console.error(`   Windows:  netstat -ano | findstr :${PORT}  then  taskkill /PID <pid> /F`);
+        console.error(`   Linux/Mac: kill -9 $(lsof -ti:${PORT})`);
+        console.error('='.repeat(50));
+      } else {
+        console.error('❌ Server error:', err.message);
+      }
+      process.exit(1);
+    });
+
     // Increase server timeout for large file uploads (14 cattle images)
     server.timeout = 300000; // 5 minutes
     server.keepAliveTimeout = 310000; // Slightly longer than timeout
