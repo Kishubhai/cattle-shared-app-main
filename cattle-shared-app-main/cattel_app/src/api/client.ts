@@ -1,9 +1,11 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import ENV from '../config/env';
-import { getToken, clearStorage } from '../utils/storage';
+import { getToken, getRefreshToken, saveToken, saveRefreshToken, clearStorage } from '../utils/storage';
 
 class ApiClient {
   private client: AxiosInstance;
+  private isRefreshing = false;
+  private failedQueue: Array<{ resolve: (token: string) => void; reject: (err: any) => void }> = [];
 
   constructor() {
     this.client = axios.create({
@@ -18,7 +20,7 @@ class ApiClient {
     this.client.interceptors.request.use(
       async (config) => {
         console.log('🌐 API Request:', config.method?.toUpperCase(), config.url);
-        
+
         const token = await getToken();
         if (token) {
           config.headers.Authorization = `Bearer ${token}`;
@@ -36,7 +38,7 @@ class ApiClient {
             delete headers['content-type'];
           }
         }
-        
+
         return config;
       },
       (error) => {
@@ -59,15 +61,67 @@ class ApiClient {
           data: error.response?.data,
         });
 
-        // Handle 401 Unauthorized — clear all auth data so app returns to login
-        if (error.response?.status === 401) {
-          console.log('🔐 Unauthorized - clearing all auth data');
-          await clearStorage();
+        const originalRequest = error.config as any;
+
+        // Handle 401 Unauthorized — try to refresh token before logging out
+        if (error.response?.status === 401 && !originalRequest._retry) {
+          if (this.isRefreshing) {
+            // Queue this request until the ongoing refresh completes
+            return new Promise((resolve, reject) => {
+              this.failedQueue.push({ resolve, reject });
+            }).then((token) => {
+              originalRequest.headers.Authorization = `Bearer ${token}`;
+              return this.client(originalRequest);
+            }).catch((err) => Promise.reject(err));
+          }
+
+          originalRequest._retry = true;
+          this.isRefreshing = true;
+
+          try {
+            const refreshToken = await getRefreshToken();
+            if (!refreshToken) {
+              throw new Error('No refresh token available');
+            }
+
+            console.log('🔄 Attempting token refresh...');
+            const response = await axios.post(`${ENV.API_BASE_URL}/auth/refresh-token`, {
+              refreshToken,
+            });
+
+            const { accessToken, refreshToken: newRefreshToken } = response.data.data.tokens;
+            await saveToken(accessToken);
+            await saveRefreshToken(newRefreshToken);
+
+            console.log('✅ Token refreshed successfully');
+            this.processQueue(null, accessToken);
+
+            originalRequest.headers.Authorization = `Bearer ${accessToken}`;
+            return this.client(originalRequest);
+          } catch (refreshError) {
+            console.log('🔐 Token refresh failed - clearing all auth data');
+            this.processQueue(refreshError, null);
+            await clearStorage();
+            return Promise.reject(refreshError);
+          } finally {
+            this.isRefreshing = false;
+          }
         }
 
         return Promise.reject(error);
       }
     );
+  }
+
+  private processQueue(error: any, token: string | null) {
+    this.failedQueue.forEach(({ resolve, reject }) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(token!);
+      }
+    });
+    this.failedQueue = [];
   }
 
   getInstance(): AxiosInstance {
