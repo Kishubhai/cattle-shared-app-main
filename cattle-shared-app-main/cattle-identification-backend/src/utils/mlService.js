@@ -1,39 +1,35 @@
+const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const FormData = require('form-data');
 
 /**
- * ML Service - HuggingFace Cattle Identification API
- * Base URL: https://pundareekaksh-cattle-id.hf.space
+ * Face + muzzle ML service (mlapp).
  *
- * Endpoints:
- *   GET  /health        → health check
- *   POST /predict       → check if cattle already exists in gallery (send image)
- *   POST /add_unknown   → add NEW cattle to gallery (send image + cattle_id)
- *   POST /add_known     → add extra image for EXISTING cattle (send image + cattle_id)
+ *   POST /identify    face_image + muzzle_image  → duplicate check and identification
+ *   POST /register    cattle_id + both images    → enroll a new cow in both galleries
+ *   POST /add_images  cattle_id + either image   → store extra photos
  *
- * /predict response:
- *   { decision: 'KNOWN'|'UNKNOWN', is_known: bool, max_similarity: float,
- *     best_match: string|null, top_matches: [...], ... }
- *
- * /add_unknown response:
- *   { status: 'added', cattle_id: string, gallery_size: int, message: string }
- *
- * /add_known response:
- *   { status: 'updated', cattle_id: string, num_images: int, message: string }
+ * /identify uses both models and returns the same fields the app already expects:
+ *   { decision, is_known, max_similarity, best_match, rule }
  */
 
-const ML_BASE_URL = 'https://pundareekaksh-cattle-id.hf.space';
-const ML_TIMEOUT_MS = parseInt(process.env.ML_TIMEOUT_MS) || 30000;
+const ML_BASE_URL = (
+  process.env.ML_URL ||
+  process.env.ML_BASE_URL ||
+  process.env.ML_SERVER_URL ||
+  ''
+).trim();
+const ML_API_KEY = (process.env.ML_API_KEY || '').trim();
+const ML_TIMEOUT_MS = parseInt(process.env.ML_TIMEOUT_MS, 10) || 30000;
 
-/**
- * Internal: POST multipart form-data to ML server
- * @param {string} endpoint - e.g. '/predict'
- * @param {FormData} form
- * @returns {object|null}
- */
 const mlPost = (endpoint, form) => {
+  if (!ML_BASE_URL) {
+    console.warn('[ML Service] ML_URL is empty; skipping', endpoint);
+    return Promise.resolve(null);
+  }
+
   return new Promise((resolve) => {
     let responseData = '';
     let settled = false;
@@ -46,28 +42,46 @@ const mlPost = (endpoint, form) => {
       }
     };
 
+    let url;
+    try {
+      url = new URL(endpoint, ML_BASE_URL.endsWith('/') ? ML_BASE_URL : `${ML_BASE_URL}/`);
+    } catch (err) {
+      console.error('[ML Service] Invalid ML_URL:', err.message);
+      settle(null);
+      return;
+    }
+
+    const lib = url.protocol === 'https:' ? https : http;
     const headers = form.getHeaders();
+    if (ML_API_KEY) headers['X-API-Key'] = ML_API_KEY;
 
-    const options = {
-      hostname: 'pundareekaksh-cattle-id.hf.space',
-      port: 443,
-      path: endpoint,
-      method: 'POST',
-      headers
-    };
-
-    const req = https.request(options, (res) => {
-      res.on('data', (chunk) => { responseData += chunk; });
-      res.on('end', () => {
-        try {
-          const result = JSON.parse(responseData);
-          settle(result);
-        } catch (e) {
-          console.error(`[ML Service] Could not parse response from ${endpoint}:`, responseData.slice(0, 200));
-          settle(null);
-        }
-      });
-    });
+    const req = lib.request(
+      {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: `${url.pathname}${url.search}`,
+        method: 'POST',
+        headers
+      },
+      (res) => {
+        res.on('data', (chunk) => {
+          responseData += chunk;
+        });
+        res.on('end', () => {
+          if (res.statusCode >= 400) {
+            console.error(`[ML Service] ${endpoint} HTTP ${res.statusCode}:`, responseData.slice(0, 300));
+            settle(null);
+            return;
+          }
+          try {
+            settle(JSON.parse(responseData));
+          } catch (err) {
+            console.error(`[ML Service] Could not parse ${endpoint}:`, responseData.slice(0, 200));
+            settle(null);
+          }
+        });
+      }
+    );
 
     req.on('error', (err) => {
       console.error(`[ML Service] Network error on ${endpoint}:`, err.message);
@@ -84,121 +98,134 @@ const mlPost = (endpoint, form) => {
   });
 };
 
+const fileOk = (filePath) => Boolean(filePath) && fs.existsSync(filePath);
+
+const appendImage = (form, field, filePath) => {
+  form.append(field, fs.createReadStream(filePath), {
+    filename: path.basename(filePath),
+    contentType: 'image/jpeg'
+  });
+};
+
+const describeMatch = (result) => {
+  if (!result || result.is_known !== true) {
+    return 'No matching cattle found in the registry';
+  }
+  const score = result.max_similarity != null
+    ? `${(result.max_similarity * 100).toFixed(1)}%`
+    : 'n/a';
+  const rule = result.rule ? ` via ${result.rule}` : '';
+  return `Matched cattle ${result.best_match} (similarity: ${score}${rule})`;
+};
+
 /**
- * Check if a cattle already exists in the ML gallery.
- * Used BEFORE registering new cattle - if KNOWN, reject duplicate.
- * Also used for cattle identification requests.
- *
- * @param {string} imagePath - Absolute path to image file on disk
- * @returns {object|null}
- *   Success: { decision: 'KNOWN'|'UNKNOWN', is_known: bool, max_similarity: float,
- *              best_match: string|null (cattleId), ... }
- *   Failure: null
+ * Ask both models whether this face + muzzle pair is already enrolled.
+ * Muzzle is optional; the face photo is required by /identify.
  */
-const predictCattle = async (imagePath) => {
-  if (!imagePath || !fs.existsSync(imagePath)) {
-    console.error('[ML Service] predictCattle: image not found at', imagePath);
+const identifyCattle = async (facePath, muzzlePath) => {
+  if (!fileOk(facePath)) {
+    console.error('[ML Service] identifyCattle: face image not found at', facePath);
     return null;
   }
   try {
     const form = new FormData();
-    form.append('image', fs.createReadStream(imagePath));
-    console.log(`[ML Service] /predict → ${path.basename(imagePath)}`);
-    const result = await mlPost('/predict', form);
-    if (result) console.log(`[ML Service] /predict result: decision=${result.decision}, similarity=${result.max_similarity}`);
+    appendImage(form, 'face_image', facePath);
+    if (fileOk(muzzlePath)) appendImage(form, 'muzzle_image', muzzlePath);
+    console.log(`[ML Service] /identify → face=${path.basename(facePath)} muzzle=${fileOk(muzzlePath) ? path.basename(muzzlePath) : 'none'}`);
+    const result = await mlPost('/identify', form);
+    if (result) {
+      console.log(`[ML Service] /identify result: decision=${result.decision}, rule=${result.rule}, similarity=${result.max_similarity}`);
+    }
     return result;
-  } catch (e) {
-    console.error('[ML Service] predictCattle error:', e.message);
+  } catch (err) {
+    console.error('[ML Service] identifyCattle error:', err.message);
     return null;
   }
 };
 
 /**
- * Register a NEW cattle in the ML gallery.
- * Called after a new cattle is created in DB (if not duplicate).
- *
- * @param {string} imagePath - Absolute path to image file
- * @param {string} cattleId  - System-generated cattle ID (e.g. C123456789)
- * @returns {object|null}
- *   Success: { status: 'added', cattle_id, gallery_size, message }
- *   Failure: null
+ * Enroll a new cow in both galleries. Both photos are required.
+ * Returns { status: 'added' | 'review_required' | 'rejected', ... } or null.
+ * review_required and rejected mean the photos were not written to the gallery.
  */
-const addUnknownCattle = async (imagePath, cattleId) => {
-  if (!imagePath || !fs.existsSync(imagePath)) {
-    console.error('[ML Service] addUnknownCattle: image not found at', imagePath);
+const enrollCattle = async (facePath, muzzlePath, cattleId) => {
+  if (!fileOk(facePath) || !fileOk(muzzlePath)) {
+    console.error('[ML Service] enrollCattle: face and muzzle images are both required', cattleId);
     return null;
   }
   try {
     const form = new FormData();
-    form.append('image', fs.createReadStream(imagePath));
     form.append('cattle_id', cattleId);
-    console.log(`[ML Service] /add_unknown → cattleId=${cattleId}`);
-    const result = await mlPost('/add_unknown', form);
-    if (result) console.log(`[ML Service] /add_unknown result: status=${result.status}, gallery_size=${result.gallery_size}`);
+    appendImage(form, 'face_image', facePath);
+    appendImage(form, 'muzzle_image', muzzlePath);
+    console.log(`[ML Service] /register → cattleId=${cattleId}`);
+    const result = await mlPost('/register', form);
+    if (result) console.log(`[ML Service] /register result: status=${result.status}`);
     return result;
-  } catch (e) {
-    console.error('[ML Service] addUnknownCattle error:', e.message);
+  } catch (err) {
+    console.error('[ML Service] enrollCattle error:', err.message);
     return null;
   }
 };
 
 /**
- * Add an additional image to an EXISTING cattle class in the ML gallery.
- * Updates the mean embedding for that cattle.
- *
- * @param {string} imagePath - Absolute path to image file
- * @param {string} cattleId  - Existing cattle ID already in gallery
- * @returns {object|null}
+ * Store extra face and/or muzzle photos for a cow already in the galleries.
  */
-const addKnownCattle = async (imagePath, cattleId) => {
-  if (!imagePath || !fs.existsSync(imagePath)) {
-    console.error('[ML Service] addKnownCattle: image not found at', imagePath);
-    return null;
-  }
+const addGalleryImages = async (cattleId, facePath, muzzlePath) => {
+  if (!fileOk(facePath) && !fileOk(muzzlePath)) return null;
   try {
     const form = new FormData();
-    form.append('image', fs.createReadStream(imagePath));
     form.append('cattle_id', cattleId);
-    console.log(`[ML Service] /add_known → cattleId=${cattleId}`);
-    const result = await mlPost('/add_known', form);
-    if (result) console.log(`[ML Service] /add_known result: status=${result.status}, num_images=${result.num_images}`);
-    return result;
-  } catch (e) {
-    console.error('[ML Service] addKnownCattle error:', e.message);
+    if (fileOk(facePath)) appendImage(form, 'face_image', facePath);
+    if (fileOk(muzzlePath)) appendImage(form, 'muzzle_image', muzzlePath);
+    return await mlPost('/add_images', form);
+  } catch (err) {
+    console.error('[ML Service] addGalleryImages error:', err.message);
     return null;
   }
 };
 
 /**
- * Run ML prediction for an identification request.
- * Uses the front image and translates HuggingFace response to our internal format.
- *
- * @param {object} identificationRequest - IdentificationRequest document
- * @returns {object|null}
- *   Success: { success: true, found: bool, confidence: number|null,
- *              cattleId: string|null, message: string }
- *   Failure: null
+ * After the first pair is enrolled, add the remaining face and muzzle photos.
+ * A failure here does not undo the enrollment.
+ */
+const enrollExtraImages = async (cattleId, facePaths = [], muzzlePaths = []) => {
+  const faces = facePaths.filter(fileOk);
+  const muzzles = muzzlePaths.filter(fileOk);
+  const count = Math.max(faces.length, muzzles.length);
+  for (let i = 0; i < count; i += 1) {
+    const added = await addGalleryImages(cattleId, faces[i], muzzles[i]);
+    if (!added) {
+      console.warn(`[ML Service] Extra image ${i + 1} was not stored for ${cattleId}`);
+    }
+  }
+};
+
+/**
+ * Identification screen: front = face section A, right = muzzle section A.
  */
 const callMLModel = async (identificationRequest) => {
-  const imagePath = identificationRequest.images?.front?.path;
-
-  if (!imagePath) {
-    console.error('[ML Service] callMLModel: no front image path on request', identificationRequest._id);
-    return null;
-  }
-
-  const result = await predictCattle(imagePath);
+  const facePath = identificationRequest.images?.front?.path;
+  const muzzlePath = identificationRequest.images?.right?.path;
+  const result = await identifyCattle(facePath, muzzlePath);
   if (!result) return null;
 
   return {
     success: true,
     found: result.is_known === true,
     confidence: result.max_similarity != null ? Math.round(result.max_similarity * 100) : null,
-    cattleId: result.best_match || null,   // This is the cattle's cattleId string (e.g. C123456789)
-    message: result.is_known
-      ? `Matched cattle ${result.best_match} (similarity: ${(result.max_similarity * 100).toFixed(1)}%)`
-      : 'No matching cattle found in the registry'
+    cattleId: result.best_match || null,
+    rule: result.rule || null,
+    message: describeMatch(result)
   };
 };
 
-module.exports = { predictCattle, addUnknownCattle, addKnownCattle, callMLModel };
+module.exports = {
+  identifyCattle,
+  needsAdminReview: (mlResult) =>
+    Boolean(mlResult && (mlResult.status === 'review_required' || mlResult.status === 'rejected')),
+  enrollCattle,
+  addGalleryImages,
+  enrollExtraImages,
+  callMLModel
+};

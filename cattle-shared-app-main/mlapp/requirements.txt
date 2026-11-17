@@ -1,0 +1,8 @@
+# Tested together with your two models (outputs verified identical to TF 2.21).
+# Needs Python 3.9-3.12 (Ubuntu 22.04 and 24.04 on Hostinger are both fine).
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+numpy==1.26.4
+pillow==10.4.0
+tensorflow-cpu==2.17.1

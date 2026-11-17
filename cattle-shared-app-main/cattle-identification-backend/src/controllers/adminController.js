@@ -1670,21 +1670,26 @@ const getMLFailedCattle = asyncHandler(async (req, res) => {
  * @access  Private (M_Admin only)
  */
 const manualMLRegisterCattle = asyncHandler(async (req, res) => {
-    const { addUnknownCattle } = require('../utils/mlService');
+    const { enrollCattle, enrollExtraImages, needsAdminReview } = require('../utils/mlService');
 
     const cattle = await Cattle.findById(req.params.id);
     if (!cattle) {
         return res.status(404).json({ success: false, message: 'Cattle not found' });
     }
 
+    const faceImage = cattle.images?.face?.[0];
     const muzzleImage = cattle.images?.muzzle?.[0];
-    if (!muzzleImage || !muzzleImage.path) {
-        return res.status(400).json({ success: false, message: 'No muzzle image available for ML registration' });
+    if (!faceImage?.path || !muzzleImage?.path) {
+        return res.status(400).json({ success: false, message: 'Face and muzzle images are both required for ML registration' });
     }
 
-    const mlResult = await addUnknownCattle(muzzleImage.path, cattle.cattleId);
+    const mlResult = await enrollCattle(faceImage.path, muzzleImage.path, cattle.cattleId);
 
     if (mlResult && mlResult.status === 'added') {
+        const extraFaces = (cattle.images.face || []).slice(1).map((img) => img.path);
+        const extraMuzzles = (cattle.images.muzzle || []).slice(1).map((img) => img.path);
+        await enrollExtraImages(cattle.cattleId, extraFaces, extraMuzzles);
+
         // ML success → auto-approve
         await Cattle.findByIdAndUpdate(cattle._id, {
             'mlRegistration.status': 'registered',
@@ -1711,6 +1716,12 @@ const manualMLRegisterCattle = asyncHandler(async (req, res) => {
             success: true,
             message: `Cattle ${cattle.cattleId} registered in AI and approved`,
             data: { cattleId: cattle.cattleId }
+        });
+    } else if (needsAdminReview(mlResult)) {
+        res.status(409).json({
+            success: false,
+            message: mlResult.message || 'Photos were not added to the gallery. Review them, then approve manually only if they show this cattle face and muzzle.',
+            data: { status: mlResult.status, face: mlResult.face, muzzle: mlResult.muzzle }
         });
     } else {
         res.status(502).json({

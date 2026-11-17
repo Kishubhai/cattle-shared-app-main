@@ -27,16 +27,17 @@ class ApiClient {
           console.log('🔑 Token attached');
         }
 
-        // Let RN set multipart boundary — forcing Content-Type breaks Multer parsing
+        // Axios keeps the default application/json header on Android FormData
+        // posts, and OkHttp then drops the upload. multipart/form-data lets
+        // the native client add the boundary.
         if (typeof FormData !== 'undefined' && config.data instanceof FormData) {
           const headers = config.headers as any;
-          if (headers?.delete) {
-            headers.delete('Content-Type');
-            headers.delete('content-type');
+          if (headers?.set) {
+            headers.set('Content-Type', 'multipart/form-data');
           } else if (headers) {
-            delete headers['Content-Type'];
-            delete headers['content-type'];
+            headers['Content-Type'] = 'multipart/form-data';
           }
+          config.transformRequest = [(body) => body];
         }
 
         return config;

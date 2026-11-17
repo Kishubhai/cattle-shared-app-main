@@ -5,7 +5,7 @@ const Notification = require('../models/Notification');
 const { asyncHandler } = require('../middlewares/errorMiddleware');
 const { deleteCattleImages, formatCattleImages } = require('../utils/imageHelper');
 const emailService = require('../utils/emailService');
-const { predictCattle, addUnknownCattle, addKnownCattle } = require('../utils/mlService');
+const { identifyCattle, enrollCattle, enrollExtraImages, needsAdminReview } = require('../utils/mlService');
 /**
  * Cattle Controller
  * Handles cattle registration, management, verification, and transfer
@@ -42,22 +42,24 @@ const registerCattle = asyncHandler(async (req, res) => {
   }
 
   // ── ML DUPLICATE CHECK ────────────────────────────────────────────────
-  // Use first muzzle image (cattle's "fingerprint") to check if already exists
+  // Face and muzzle models must agree (or one must be strongly confident)
+  // before a registration is rejected as a repeat.
+  const firstFaceFile = req.files.face?.[0];
   const firstMuzzleFile = req.files.muzzle?.[0];
-  if (firstMuzzleFile) {
-    const mlPredict = await predictCattle(firstMuzzleFile.path);
+  if (firstFaceFile) {
+    const mlPredict = await identifyCattle(firstFaceFile.path, firstMuzzleFile?.path);
     if (mlPredict && mlPredict.is_known === true) {
-      // ML says this cattle already exists in the registry
       return res.status(409).json({
         success: false,
         message: 'This cattle already exists in the system. Duplicate registration is not allowed.',
         data: {
           matchedCattleId: mlPredict.best_match,
-          similarity: mlPredict.max_similarity
+          similarity: mlPredict.max_similarity,
+          rule: mlPredict.rule
         }
       });
     }
-    // mlPredict === null means ML is unavailable → we allow registration to proceed
+    // mlPredict === null means ML is unavailable → registration still proceeds
   }
   // ─────────────────────────────────────────────────────────────────────
 
@@ -171,10 +173,11 @@ const registerCattle = asyncHandler(async (req, res) => {
   // After responding to user, try to add cattle to ML gallery
   setImmediate(async () => {
     try {
+      const faceFile = req.files.face?.[0];
       const muzzleFile = req.files.muzzle?.[0];
-      if (!muzzleFile) return;
+      if (!faceFile || !muzzleFile) return;
 
-      const mlResult = await addUnknownCattle(muzzleFile.path, cattle.cattleId);
+      const mlResult = await enrollCattle(faceFile.path, muzzleFile.path, cattle.cattleId);
 
       if (mlResult && mlResult.status === 'added') {
         // ML registration successful → auto-approve cattle
@@ -197,9 +200,39 @@ const registerCattle = asyncHandler(async (req, res) => {
           relatedCattle: cattle._id,
           priority: 'medium'
         });
-        console.log(`[ML Cattle] Successfully registered ${cattle.cattleId} in ML gallery – auto-approved`);
+        const extraFaces = (req.files.face || []).slice(1).map((file) => file.path);
+        const extraMuzzles = (req.files.muzzle || []).slice(1).map((file) => file.path);
+        await enrollExtraImages(cattle.cattleId, extraFaces, extraMuzzles);
+        console.log(`[ML Cattle] Successfully registered ${cattle.cattleId} in face and muzzle galleries – auto-approved`);
+      } else if (needsAdminReview(mlResult)) {
+        await Cattle.findByIdAndUpdate(cattle._id, {
+          'mlRegistration.status': 'manual_pending',
+          'mlRegistration.retryCount': 0,
+          'mlRegistration.lastRetryAt': new Date(),
+          $unset: { 'mlRegistration.nextRetryAt': '' }
+        });
+        const reason = mlResult.status === 'rejected'
+          ? `Photos for cattle ${cattle.cattleId} were not accepted as a cow face and muzzle, so they were not added to the gallery.`
+          : `Cattle photo check is not active, so ${cattle.cattleId} was not added to the gallery.`;
+        console.log(`[ML Cattle] ${reason} Left for M-Admin.`);
+        const Admin = require('../models/Admin');
+        const mAdmins = await Admin.find({ role: 'm_admin', isActive: true, isApproved: true });
+        for (const mAdmin of mAdmins) {
+          await Notification.create({
+            recipient: mAdmin._id,
+            recipientModel: 'Admin',
+            type: 'ml_registration_failed',
+            title: 'Cattle photos need review',
+            message: `${reason} Farmer: ${user.fullName}. Approve only if the photos show this animal's face and muzzle.`,
+            relatedCattle: cattle._id,
+            relatedUser: user._id,
+            priority: 'high',
+            actionUrl: `/m-admin/ml-failed-cattle/${cattle._id}`,
+            actionText: 'Review Now'
+          });
+        }
       } else {
-        // ML registration failed – schedule retries (every 30 min, up to 2 hours)
+        // ML service unavailable – schedule retries (every 30 min, up to 2 hours)
         const nextRetry = new Date(Date.now() + 30 * 60 * 1000);
         await Cattle.findByIdAndUpdate(cattle._id, {
           'mlRegistration.status': 'in_progress',

@@ -1,0 +1,16 @@
+[Unit]
+Description=Cattle ID ML service (face + muzzle)
+After=network.target
+
+[Service]
+User=mlapp
+Group=mlapp
+WorkingDirectory=/opt/mlapp
+EnvironmentFile=/etc/mlapp.env
+# --workers 1 is REQUIRED: each worker would hold its own copy of the gallery.
+ExecStart=/opt/mlapp/venv/bin/uvicorn main:app --host ${ML_HOST} --port 8000 --workers 1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

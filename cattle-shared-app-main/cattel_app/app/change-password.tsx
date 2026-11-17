@@ -66,7 +66,7 @@ export default function ChangePasswordScreen() {
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
-      setTimeout(() => router.back(), 1000);
+      setTimeout(() => router.back(), 10000);
     } catch (error: any) {
       const { text1, text2 } = getErrorToast(error, 'general');
       Toast.show({ type: 'error', text1, text2, visibilityTime: 5000 });

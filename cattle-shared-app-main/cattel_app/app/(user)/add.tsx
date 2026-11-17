@@ -96,8 +96,8 @@ export default function AddCattleScreen() {
 
       Toast.show({
         type: 'success',
-        text1: 'Cattle Registered Successfully',
-        text2: 'Your cattle is being verified by our AI system and team.',
+        text1: 'Registration submitted',
+        text2: 'An admin will confirm the face and muzzle photos before this animal is approved.',
       });
 
       setFormData({
